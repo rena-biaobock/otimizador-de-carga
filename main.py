@@ -63,7 +63,7 @@ def merge_estoque_by_progressivo(estoque_exp, estoque_pce, key='progressivo'):
     return merged_df.to_dict(orient='records')
 
 
-def pack_loads_by_weight(df, weight_col='peso', capacity_kg=27000, client_col=None):
+def pack_loads_by_weight(df, weight_col='peso', capacity_kg=27000, client_col=None, date_col=None):
     """Pack items in loads by weight (First-Fit Decreasing) and compute occupancy.
 
     Args:
@@ -71,6 +71,7 @@ def pack_loads_by_weight(df, weight_col='peso', capacity_kg=27000, client_col=No
         weight_col (str): column name that stores weight in kg.
         capacity_kg (float): maximum load capacity in kg (default 27000).
         client_col (str): if provided, groups by client first (each client gets separate loads).
+        date_col (str): if provided, sorts by date ascending (oldest first) before weight.
 
     Returns:
         pd.DataFrame: source columns plus load_id, load_total_weight, load_occupancy.
@@ -93,6 +94,12 @@ def pack_loads_by_weight(df, weight_col='peso', capacity_kg=27000, client_col=No
     df = df.copy()
     df['__item_weight'] = pd.to_numeric(df[weight_col], errors='coerce').fillna(0)
 
+    # se date_col fornecido, tenta converter para datetime
+    if date_col and date_col in df.columns:
+        df['__sort_date'] = pd.to_datetime(df[date_col], errors='coerce')
+    else:
+        df['__sort_date'] = pd.NaT
+
     # se client_col fornecido, agrupa por cliente
     if client_col and client_col in df.columns:
         load_counter = 1
@@ -100,8 +107,10 @@ def pack_loads_by_weight(df, weight_col='peso', capacity_kg=27000, client_col=No
             client_df = df[df[client_col] == client]
             client_indices = client_df.index
             
-            # FFD para este cliente
-            sorted_idx = client_df['__item_weight'].sort_values(ascending=False).index
+            # ordena por data ascendente, depois peso descendente
+            client_df = client_df.sort_values(by=['__sort_date', '__item_weight'], ascending=[True, False])
+            sorted_idx = client_df.index
+            
             loads = []
             assignment = {}
             
@@ -143,7 +152,9 @@ def pack_loads_by_weight(df, weight_col='peso', capacity_kg=27000, client_col=No
         df.loc[df['load_id'] == 0, 'load_occupancy'] = 0.0
     else:
         # FFD simples (sem agrupamento por cliente)
-        sorted_idx = df['__item_weight'].sort_values(ascending=False).index
+        # ordena por data ascendente, depois peso descendente
+        df = df.sort_values(by=['__sort_date', '__item_weight'], ascending=[True, False])
+        sorted_idx = df.index
 
         loads = []
         assignment = []
@@ -177,7 +188,7 @@ def pack_loads_by_weight(df, weight_col='peso', capacity_kg=27000, client_col=No
 
         df.loc[df['load_id'] == 0, 'load_occupancy'] = 0.0
 
-    df.drop(columns=['__item_weight'], inplace=True)
+    df.drop(columns=['__item_weight', '__sort_date'], inplace=True)
     return df
 
 
@@ -189,8 +200,8 @@ def save_packed_loads(df, output_path, index=False):
         df.to_csv(output_path, index=index)
 
 
-def filter_estoque(df, mi_me_col='MI/ME', mi_me_value='ME', fardo_col='Fardo Padrão', fardo_value='Sim'):
-    """Filtra estoque por MI/ME e Fardo Padrão.
+def filter_estoque(df, mi_me_col='MI/ME', mi_me_value='ME', fardo_col='Fardo Padrão', fardo_value='Sim', date_col='Data Saida Pedido', max_date=None):
+    """Filtra estoque por MI/ME, Fardo Padrão e data máxima.
     
     Args:
         df (pd.DataFrame or list[dict]): dados originais.
@@ -198,6 +209,8 @@ def filter_estoque(df, mi_me_col='MI/ME', mi_me_value='ME', fardo_col='Fardo Pad
         mi_me_value (str): valor a filtrar em MI/ME (default 'ME').
         fardo_col (str): nome da coluna Fardo Padrão.
         fardo_value (str): valor a filtrar em Fardo Padrão (default 'Sim').
+        date_col (str): nome da coluna de data.
+        max_date (str or datetime): data máxima (inclusive). Se None, não filtra por data.
     
     Returns:
         pd.DataFrame: dados filtrados.
@@ -214,6 +227,12 @@ def filter_estoque(df, mi_me_col='MI/ME', mi_me_value='ME', fardo_col='Fardo Pad
     # filtro case-insensitive para Fardo Padrão
     if fardo_col in df.columns:
         df = df[df[fardo_col].astype(str).str.strip() == fardo_value]
+    
+    # filtro por data máxima
+    if max_date and date_col in df.columns:
+        max_date_dt = pd.to_datetime(max_date)
+        df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+        df = df[df[date_col] <= max_date_dt]
     
     return df
 
@@ -261,8 +280,8 @@ if __name__ == '__main__':
         merged_df = merged_converted
     save_packed_loads(merged_df, merged_output)
     
-    filtered = filter_estoque(merged_converted, mi_me_col='MI/ME', mi_me_value='ME', fardo_col='Fardo Padrão', fardo_value='Sim')
-    packed = pack_loads_by_weight(filtered, weight_col='Volume Geral', capacity_kg=27000, client_col='Cliente')
+    filtered = filter_estoque(merged_converted, mi_me_col='MI/ME', mi_me_value='ME', fardo_col='Fardo Padrão', fardo_value='Sim', date_col='Data Saida Pedido', max_date='2026-03-31')
+    packed = pack_loads_by_weight(filtered, weight_col='Volume Geral', capacity_kg=27000, client_col='Cliente', date_col='Data Saida Pedido')
     save_packed_loads(packed, output_path)
 
     print(f'Gerado: {merged_output} (merged com Volume Geral em kg)')
