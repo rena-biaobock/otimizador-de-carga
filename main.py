@@ -1,288 +1,241 @@
 import os
-import json
+from typing import Union
+
 import pandas as pd
 
+DataInput = Union[pd.DataFrame, list[dict]]
 
-def read_estoque_files(estoque_exp_path, estoque_pce_path, file_format='csv'):
-    """Read estoque_exp and estoque_pce with pandas (CSV or JSON)."""
+
+def _coerce_to_df(data: DataInput, label: str = "data") -> pd.DataFrame:
+    if isinstance(data, pd.DataFrame):
+        return data.copy()
+    if isinstance(data, list):
+        return pd.DataFrame(data)
+    raise TypeError(f"{label} must be a DataFrame or list of dicts")
+
+
+def _resolve_col(df: pd.DataFrame, col: str) -> str:
+    """Return the actual column name, resolving case-insensitively if needed."""
+    if col in df.columns:
+        return col
+    lower_map = {c.lower(): c for c in df.columns}
+    if col.lower() in lower_map:
+        return lower_map[col.lower()]
+    raise KeyError(f"Column '{col}' not found (available: {list(df.columns)})")
+
+
+def _ffd_assign(
+    indices: list,
+    weights: dict,
+    capacity: float,
+    start_id: int = 1,
+) -> tuple[dict, int]:
+    """First-Fit Decreasing bin assignment.
+
+    Returns (assignment, next_start_id) where assignment maps index → load_id.
+    Items with weight <= 0 are assigned load_id 0.
+    """
+    loads: list[dict] = []
+    assignment: dict[int, int] = {}
+    next_id = start_id
+
+    for i in indices:
+        w = weights[i]
+        if w <= 0:
+            assignment[i] = 0
+            continue
+        for load in loads:
+            if load["remaining"] >= w:
+                load["remaining"] -= w
+                assignment[i] = load["id"]
+                break
+        else:
+            loads.append({"id": next_id, "remaining": capacity - w})
+            assignment[i] = next_id
+            next_id += 1
+
+    return assignment, next_id
+
+
+def read_estoque_files(
+    estoque_exp_path: str,
+    estoque_pce_path: str,
+    file_format: str = "csv",
+) -> dict[str, pd.DataFrame]:
+    """Read estoque_exp and estoque_pce files (CSV, JSON, or XLSX)."""
     if not os.path.exists(estoque_exp_path):
         raise FileNotFoundError(f"estoque_exp file not found: {estoque_exp_path}")
     if not os.path.exists(estoque_pce_path):
         raise FileNotFoundError(f"estoque_pce file not found: {estoque_pce_path}")
 
-    format_lower = file_format.lower()
-    if format_lower not in {'csv', 'json', 'xlsx'}:
+    fmt = file_format.lower()
+    if fmt not in {"csv", "json", "xlsx"}:
         raise ValueError("Unsupported file_format: choose 'csv', 'json' or 'xlsx'")
 
-    if pd is None:
-        raise ImportError("pandas is required for this function. Install with `pip install pandas`.")
-
-    if format_lower == 'csv':
-        estoque_exp = pd.read_csv(estoque_exp_path, dtype=str).fillna('')
-        estoque_pce = pd.read_csv(estoque_pce_path, dtype=str).fillna('')
-    elif format_lower == 'xlsx':
-        estoque_exp = pd.read_excel(estoque_exp_path, dtype=str).fillna('')
-        estoque_pce = pd.read_excel(estoque_pce_path, dtype=str).fillna('')
-    else:
-        estoque_exp = pd.read_json(estoque_exp_path, dtype=False)
-        estoque_pce = pd.read_json(estoque_pce_path, dtype=False)
-
-    return {'estoque_exp': estoque_exp, 'estoque_pce': estoque_pce}
+    readers = {
+        "csv": lambda p: pd.read_csv(p, dtype=str).fillna(""),
+        "xlsx": lambda p: pd.read_excel(p, dtype=str).fillna(""),
+        "json": lambda p: pd.read_json(p, dtype=False),
+    }
+    read = readers[fmt]
+    return {"estoque_exp": read(estoque_exp_path), "estoque_pce": read(estoque_pce_path)}
 
 
-def merge_estoque_by_progressivo(estoque_exp, estoque_pce, key='progressivo'):
-    """Merge estoque_exp and estoque_pce by key with estoque_exp priority using pandas."""
-    if pd is None:
-        raise ImportError("pandas is required for this function. Install with `pip install pandas`.")
-
-    def _to_df(data):
-        if isinstance(data, pd.DataFrame):
-            df = data.copy()
-        elif isinstance(data, list):
-            df = pd.DataFrame(data)
-        else:
-            raise TypeError('estoque data must be pandas DataFrame or list of dicts')
-
-        if key not in df.columns:
-            # tenta correspondência case-insensitive
-            cols_lower = {c.lower(): c for c in df.columns}
-            if key.lower() in cols_lower:
-                mapped_key = cols_lower[key.lower()]
-                df = df.rename(columns={mapped_key: key})
-            else:
-                raise KeyError(
-                    f"Missing key '{key}' in data (colunas encontradas: {list(df.columns)})"
-                )
-
+def merge_estoque_by_progressivo(
+    estoque_exp: DataInput,
+    estoque_pce: DataInput,
+    key: str = "progressivo",
+) -> list[dict]:
+    """Merge two inventory sources by key, with estoque_exp taking priority."""
+    def to_indexed(data: DataInput) -> pd.DataFrame:
+        df = _coerce_to_df(data, "estoque")
+        actual_key = _resolve_col(df, key)
+        if actual_key != key:
+            df = df.rename(columns={actual_key: key})
         return df.astype({key: str}).set_index(key, drop=False)
 
-    df_exp = _to_df(estoque_exp)
-    df_pce = _to_df(estoque_pce)
-
-    merged_df = df_exp.combine_first(df_pce).reset_index(drop=True)
-    return merged_df.to_dict(orient='records')
+    merged = to_indexed(estoque_exp).combine_first(to_indexed(estoque_pce))
+    return merged.reset_index(drop=True).to_dict(orient="records")
 
 
-def pack_loads_by_weight(df, weight_col='peso', capacity_kg=27000, client_col=None, date_col=None):
-    """Pack items in loads by weight (First-Fit Decreasing) and compute occupancy.
+def pack_loads_by_weight(
+    df: DataInput,
+    weight_col: str = "peso",
+    capacity_kg: float = 27000,
+    client_col: str | None = None,
+    date_col: str | None = None,
+) -> pd.DataFrame:
+    """Pack items into loads using First-Fit Decreasing by weight.
 
     Args:
-        df (pd.DataFrame or list[dict]): source dataset with weight values.
-        weight_col (str): column name that stores weight in kg.
-        capacity_kg (float): maximum load capacity in kg (default 27000).
-        client_col (str): if provided, groups by client first (each client gets separate loads).
-        date_col (str): if provided, sorts by date ascending (oldest first) before weight.
+        df: Source data with weight values.
+        weight_col: Column storing weight in kg.
+        capacity_kg: Maximum load capacity in kg.
+        client_col: If set, each client gets independent load numbering.
+        date_col: If set, older items are packed before heavier ones.
 
     Returns:
-        pd.DataFrame: source columns plus load_id, load_total_weight, load_occupancy.
+        Input columns plus load_id, load_total_weight, load_occupancy.
+        Items with weight <= 0 receive load_id 0 and occupancy 0.
     """
-    if pd is None:
-        raise ImportError("pandas is required for this function. Install with `pip install pandas`.")
+    df = _coerce_to_df(df)
+    weight_col = _resolve_col(df, weight_col)
 
-    if not isinstance(df, pd.DataFrame):
-        df = pd.DataFrame(df)
+    df["__weight"] = pd.to_numeric(df[weight_col], errors="coerce").fillna(0)
+    df["__date"] = (
+        pd.to_datetime(df[date_col], errors="coerce")
+        if date_col and date_col in df.columns
+        else pd.NaT
+    )
 
-    if weight_col not in df.columns:
-        cols_lower = {c.lower(): c for c in df.columns}
-        if weight_col.lower() in cols_lower:
-            weight_col = cols_lower[weight_col.lower()]
-        else:
-            raise KeyError(
-                f"Weight column '{weight_col}' not found (colunas disponíveis: {list(df.columns)})"
-            )
+    weights = df["__weight"].to_dict()
+    all_assignments: dict = {}
+    next_id = 1
 
-    df = df.copy()
-    df['__item_weight'] = pd.to_numeric(df[weight_col], errors='coerce').fillna(0)
+    groups = (
+        df.groupby(client_col, dropna=False, sort=False).groups
+        if client_col and client_col in df.columns
+        else {"_all": df.index}
+    )
 
-    # se date_col fornecido, tenta converter para datetime
-    if date_col and date_col in df.columns:
-        df['__sort_date'] = pd.to_datetime(df[date_col], errors='coerce')
-    else:
-        df['__sort_date'] = pd.NaT
+    for group_indices in groups.values():
+        sorted_idx = (
+            df.loc[group_indices]
+            .sort_values(["__date", "__weight"], ascending=[True, False])
+            .index.tolist()
+        )
+        assignment, next_id = _ffd_assign(sorted_idx, weights, capacity_kg, next_id)
+        all_assignments.update(assignment)
 
-    # se client_col fornecido, agrupa por cliente
-    if client_col and client_col in df.columns:
-        load_counter = 1
-        for client in df[client_col].unique():
-            client_df = df[df[client_col] == client]
-            client_indices = client_df.index
-            
-            # ordena por data ascendente, depois peso descendente
-            client_df = client_df.sort_values(by=['__sort_date', '__item_weight'], ascending=[True, False])
-            sorted_idx = client_df.index
-            
-            loads = []
-            assignment = {}
-            
-            for i in sorted_idx:
-                weight = float(df.at[i, '__item_weight'])
-                if weight <= 0:
-                    assignment[i] = 0
-                    continue
-                
-                placed = False
-                for load in loads:
-                    if load['weight'] + weight <= capacity_kg:
-                        load['weight'] += weight
-                        assignment[i] = load['id']
-                        placed = True
-                        break
-                
-                if not placed:
-                    new_load_id = load_counter if load_counter > 0 else len(loads) + load_counter
-                    loads.append({'id': new_load_id, 'weight': weight})
-                    assignment[i] = new_load_id
-                    load_counter += 1
-            
-            # atribui load_id do cliente
-            for idx, load_id in assignment.items():
-                df.at[idx, 'load_id'] = load_id
-        
-        # computa load_total_weight e occupancy
-        df['load_total_weight'] = 0.0
-        df['load_occupancy'] = 0.0
-        for load_id in df['load_id'].unique():
-            if load_id == 0:
-                continue
-            load_rows = df[df['load_id'] == load_id]
-            total_weight = load_rows['__item_weight'].sum()
-            df.loc[load_rows.index, 'load_total_weight'] = total_weight
-            df.loc[load_rows.index, 'load_occupancy'] = total_weight / capacity_kg
-        
-        df.loc[df['load_id'] == 0, 'load_occupancy'] = 0.0
-    else:
-        # FFD simples (sem agrupamento por cliente)
-        # ordena por data ascendente, depois peso descendente
-        df = df.sort_values(by=['__sort_date', '__item_weight'], ascending=[True, False])
-        sorted_idx = df.index
+    df["load_id"] = pd.Series(all_assignments)
+    active = df["load_id"] != 0
+    load_totals = df[active].groupby("load_id")["__weight"].sum()
+    df["load_total_weight"] = df["load_id"].map(load_totals).fillna(0)
+    df["load_occupancy"] = (df["load_total_weight"] / capacity_kg).clip(0, 1)
+    df.loc[~active, "load_occupancy"] = 0.0
 
-        loads = []
-        assignment = []
-
-        for i in sorted_idx:
-            weight = float(df.at[i, '__item_weight'])
-            if weight <= 0:
-                assignment.append((i, 0))
-                continue
-
-            placed = False
-            for load in loads:
-                if load['weight'] + weight <= capacity_kg:
-                    load['weight'] += weight
-                    assignment.append((i, load['id']))
-                    placed = True
-                    break
-
-            if not placed:
-                new_load_id = len(loads) + 1
-                loads.append({'id': new_load_id, 'weight': weight})
-                assignment.append((i, new_load_id))
-
-        assign_df = pd.DataFrame(assignment, columns=['index', 'load_id'])
-        assign_df = assign_df.set_index('index')
-        df = df.join(assign_df)
-
-        load_weights = pd.DataFrame(loads).set_index('id')
-        df['load_total_weight'] = df['load_id'].map(load_weights['weight']).fillna(0)
-        df['load_occupancy'] = (df['load_total_weight'] / capacity_kg).clip(0, 1)
-
-        df.loc[df['load_id'] == 0, 'load_occupancy'] = 0.0
-
-    df.drop(columns=['__item_weight', '__sort_date'], inplace=True)
-    return df
+    return df.drop(columns=["__weight", "__date"])
 
 
-def save_packed_loads(df, output_path, index=False):
-    """Salva a planilha com os dados de carga já empacotados."""
-    if isinstance(output_path, str) and output_path.lower().endswith(('.xlsx', '.xls')):
+def save_packed_loads(df: pd.DataFrame, output_path: str, index: bool = False) -> None:
+    """Save DataFrame to XLSX or CSV based on file extension."""
+    if output_path.lower().endswith((".xlsx", ".xls")):
         df.to_excel(output_path, index=index)
     else:
         df.to_csv(output_path, index=index)
 
 
-def filter_estoque(df, mi_me_col='MI/ME', mi_me_value='ME', fardo_col='Fardo Padrão', fardo_value='Sim', date_col='Data Saida Pedido', max_date=None):
-    """Filtra estoque por MI/ME, Fardo Padrão e data máxima.
-    
-    Args:
-        df (pd.DataFrame or list[dict]): dados originais.
-        mi_me_col (str): nome da coluna MI/ME.
-        mi_me_value (str): valor a filtrar em MI/ME (default 'ME').
-        fardo_col (str): nome da coluna Fardo Padrão.
-        fardo_value (str): valor a filtrar em Fardo Padrão (default 'Sim').
-        date_col (str): nome da coluna de data.
-        max_date (str or datetime): data máxima (inclusive). Se None, não filtra por data.
-    
-    Returns:
-        pd.DataFrame: dados filtrados.
-    """
-    if not isinstance(df, pd.DataFrame):
-        df = pd.DataFrame(df)
+def filter_estoque(
+    df: DataInput,
+    mi_me_col: str = "MI/ME",
+    mi_me_value: str = "ME",
+    fardo_col: str = "Fardo Padrão",
+    fardo_value: str = "Sim",
+    date_col: str = "Data Saida Pedido",
+    max_date=None,
+) -> pd.DataFrame:
+    """Filter inventory by MI/ME type, standard-bale flag, and optional max date."""
+    df = _coerce_to_df(df, "estoque")
 
-    df = df.copy()
-    
-    # filtro case-insensitive para MI/ME
     if mi_me_col in df.columns:
         df = df[df[mi_me_col].astype(str).str.strip() == mi_me_value]
-    
-    # filtro case-insensitive para Fardo Padrão
     if fardo_col in df.columns:
         df = df[df[fardo_col].astype(str).str.strip() == fardo_value]
-    
-    # filtro por data máxima
     if max_date and date_col in df.columns:
-        max_date_dt = pd.to_datetime(max_date)
-        df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
-        df = df[df[date_col] <= max_date_dt]
-    
+        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df = df[df[date_col] <= pd.to_datetime(max_date)]
+
     return df
 
 
-def convert_to_numeric(df, col_name, replace_comma=True):
-    """Converte coluna para número, substituindo vírgula por ponto se necessário.
-    
-    Args:
-        df (pd.DataFrame or list[dict]): dataframe ou lista de dicts.
-        col_name (str): nome da coluna a converter.
-        replace_comma (bool): se True, substitui ',' por '.' antes de converter.
-    
-    Returns:
-        pd.DataFrame: dataframe com coluna convertida.
-    """
-    if not isinstance(df, pd.DataFrame):
-        df = pd.DataFrame(df)
-    
-    df = df.copy()
-    
+def convert_to_numeric(
+    df: DataInput,
+    col_name: str,
+    replace_comma: bool = True,
+) -> pd.DataFrame:
+    """Convert a column to float, optionally replacing comma decimals first."""
+    df = _coerce_to_df(df)
+
     if col_name in df.columns:
         if replace_comma:
-            df[col_name] = df[col_name].astype(str).str.replace(',', '.', regex=False)
-        df[col_name] = pd.to_numeric(df[col_name], errors='coerce').fillna(0)
-    
+            df[col_name] = df[col_name].astype(str).str.replace(",", ".", regex=False)
+        df[col_name] = pd.to_numeric(df[col_name], errors="coerce").fillna(0)
+
     return df
 
 
-if __name__ == '__main__':
-    estoque_exp_path = 'estoque_exp.xlsx'
-    estoque_pce_path = 'estoque_pce.xlsx'
-    merged_output = 'merged.xlsx'
-    output_path = 'packed_loads.xlsx'
+def main() -> None:
+    estoque_exp_path = "estoque_exp.xlsx"
+    estoque_pce_path = "estoque_pce.xlsx"
+    merged_output = "merged.xlsx"
+    output_path = "packed_loads.xlsx"
 
-    dados = read_estoque_files(estoque_exp_path, estoque_pce_path, file_format='xlsx')
-    merged = merge_estoque_by_progressivo(dados['estoque_exp'], dados['estoque_pce'])
-    
-    # converter Volume Geral antes de salvar merged
-    merged_converted = convert_to_numeric(merged, col_name='Volume Geral', replace_comma=True)
-    
-    # salvar merged com Volume Geral em número
-    if isinstance(merged_converted, list):
-        merged_df = pd.DataFrame(merged_converted)
-    else:
-        merged_df = merged_converted
+    dados = read_estoque_files(estoque_exp_path, estoque_pce_path, file_format="xlsx")
+    merged = merge_estoque_by_progressivo(dados["estoque_exp"], dados["estoque_pce"])
+    merged_df = convert_to_numeric(merged, col_name="Volume Geral")
     save_packed_loads(merged_df, merged_output)
-    
-    filtered = filter_estoque(merged_converted, mi_me_col='MI/ME', mi_me_value='ME', fardo_col='Fardo Padrão', fardo_value='Sim', date_col='Data Saida Pedido', max_date='2026-03-31')
-    packed = pack_loads_by_weight(filtered, weight_col='Volume Geral', capacity_kg=27000, client_col='Cliente', date_col='Data Saida Pedido')
+
+    filtered = filter_estoque(
+        merged_df,
+        mi_me_col="MI/ME",
+        mi_me_value="ME",
+        fardo_col="Fardo Padrão",
+        fardo_value="Sim",
+        date_col="Data Saida Pedido",
+        max_date="2026-03-31",
+    )
+    packed = pack_loads_by_weight(
+        filtered,
+        weight_col="Volume Geral",
+        capacity_kg=27000,
+        client_col="Cliente",
+        date_col="Data Saida Pedido",
+    )
     save_packed_loads(packed, output_path)
 
-    print(f'Gerado: {merged_output} (merged com Volume Geral em kg)')
-    print(f'Gerado: {output_path} | cargas: {packed.load_id.nunique()} | total itens: {len(packed)}')
+    print(f"Gerado: {merged_output} (merged com Volume Geral em kg)")
+    print(f"Gerado: {output_path} | cargas: {packed['load_id'].nunique()} | total itens: {len(packed)}")
+
+
+if __name__ == "__main__":
+    main()
